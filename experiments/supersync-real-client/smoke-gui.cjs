@@ -20,7 +20,10 @@ const fs=require('node:fs');
  await misc.waitFor({state:'visible',timeout:15000});
  const collapsible=misc.locator('collapsible');
  if(!await collapsible.evaluate(e=>e.classList.contains('isExpanded')))await collapsible.locator('.collapsible-header').click();
- await misc.getByRole('checkbox',{name:'Enable local REST API (desktop only)'}).check();
+ await misc.locator('.collapsible-panel').waitFor({state:'visible'});
+ console.log('Settings diagnostics:',await page.evaluate(()=>({url:location.href,hasNativeBridge:!!window.ea,userAgent:navigator.userAgent,checkboxes:[...document.querySelectorAll('.section-misc input[type=checkbox]')].map(e=>({id:e.id,name:e.name,labels:[...e.labels||[]].map(l=>l.textContent.trim())}))})));
+ // Formly derives the control ID from the config key; do not depend on locale.
+ await misc.locator('input[type=checkbox][id*=isLocalRestApiEnabled]').check();
  let token;
  for(let i=0;i<100;i++){try{token=fs.readFileSync('/data/profile/local-rest-api-token','utf8').trim();if(token)break;}catch{}await new Promise(r=>setTimeout(r,100));}
  if(!token)throw Error('Native API token was not persisted');
