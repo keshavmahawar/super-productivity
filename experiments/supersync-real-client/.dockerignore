@@ -1,0 +1,5 @@
+*
+!Dockerfile
+!proxy.cjs
+!start.sh
+!smoke-gui.cjs

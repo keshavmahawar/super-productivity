@@ -1,0 +1,15 @@
+services:
+  task-client:
+    build: .
+    image: superproductivity-real-client:local
+    init: true
+    restart: unless-stopped
+    shm_size: 1gb
+    ports: ['127.0.0.1:6080:6080', '127.0.0.1:3877:3877']
+    volumes: ['client-profile:/data']
+    secrets: [setup_vnc_password]
+secrets:
+  setup_vnc_password:
+    file: ./secrets/setup-vnc-password.txt
+volumes:
+  client-profile:

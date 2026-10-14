@@ -1,0 +1,60 @@
+name: Build and publish real Super Productivity task client
+
+on:
+  push:
+    branches: [experiment/real-task-client]
+    paths:
+      - 'experiments/supersync-real-client/**'
+      - '.github/workflows/publish-real-task-client.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+concurrency:
+  group: real-task-client-publication
+  cancel-in-progress: false
+
+jobs:
+  build-test-publish:
+    if: github.repository == 'keshavmahawar/super-productivity' && github.ref == 'refs/heads/experiment/real-task-client'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    defaults:
+      run:
+        working-directory: experiments/supersync-real-client
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+      - name: Test API gateway
+        run: node --test proxy.test.cjs
+      - name: Build pinned production application
+        run: |
+          docker build --label org.opencontainers.image.source=https://github.com/keshavmahawar/super-productivity --label org.opencontainers.image.revision=${{ github.sha }} -t superproductivity-real-client:local .
+      - name: Verify real client container startup and API routing
+        run: bash smoke-container.sh
+      - name: Publish and verify registry digest
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          export DOCKER_CONFIG="$(mktemp -d)"
+          trap 'docker logout ghcr.io >/dev/null 2>&1 || true; rm -rf "$DOCKER_CONFIG"' EXIT
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+          image=ghcr.io/keshavmahawar/supersync-task-client
+          docker tag superproductivity-real-client:local "$image:sha-$SOURCE_SHA"
+          docker tag superproductivity-real-client:local "$image:experimental"
+          docker push "$image:sha-$SOURCE_SHA"
+          docker push "$image:experimental"
+          docker pull "$image:sha-$SOURCE_SHA"
+          digest="$(docker image inspect "$image:sha-$SOURCE_SHA" --format '{{index .RepoDigests 0}}')"
+          test -n "$digest"
+          printf '%s\n' "Verified image: $digest"
+          printf '%s\n' "- $digest" >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' 'Production Electron client. Complete native account/sync/API setup through loopback-only setup UI. Two-device encrypted sync requires separate verification.' >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,57 @@
+services:
+  superproductivity-sync:
+    image: superproductivity-sync:pinned-local
+    build:
+      context: https://github.com/super-productivity/super-productivity.git#173b3fa35f744bde46222a5bc141986a35bd5fb5
+      dockerfile: packages/super-sync-server/Dockerfile
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: '1900'
+      DATABASE_URL: postgresql://supersync:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@postgres:5432/supersync?connection_limit=20&pool_timeout=10
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET}
+      RUN_MIGRATIONS_ON_STARTUP: 'true'
+      REQUIRE_DATABASE_POOL_LIMITS: 'true'
+      PUBLIC_URL: ${PUBLIC_URL:?Set the externally reachable HTTPS server URL}
+      WEBAUTHN_RP_ID: ${WEBAUTHN_RP_ID:?Set the HTTPS server hostname}
+      WEBAUTHN_ORIGIN: ${PUBLIC_URL:?Set the externally reachable HTTPS server URL}
+      SMTP_HOST: ${SMTP_HOST:?Configure SMTP for normal account authentication}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+    ports: ['127.0.0.1:1900:1900']
+    volumes: ['sync-data:/app/data']
+    depends_on:
+      postgres: { condition: service_healthy }
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: supersync
+      POSTGRES_USER: supersync
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+    volumes: ['postgres-data:/var/lib/postgresql/data']
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U supersync -d supersync']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  task-client:
+    build: .
+    image: superproductivity-real-client:local
+    init: true
+    restart: unless-stopped
+    shm_size: 1gb
+    ports: ['127.0.0.1:6080:6080', '127.0.0.1:3877:3877']
+    volumes: ['client-profile:/data']
+    secrets: [setup_vnc_password]
+    depends_on: [superproductivity-sync]
+secrets:
+  setup_vnc_password:
+    file: ./secrets/setup-vnc-password.txt
+volumes:
+  postgres-data:
+  sync-data:
+  client-profile:
