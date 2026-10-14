@@ -30,6 +30,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           persist-credentials: false
+      - name: Record container runtime security baseline
+        run: |
+          docker version
+          docker info --format '{{json .SecurityOptions}}'
+          uname -a
+          for setting in /proc/sys/kernel/unprivileged_userns_clone /proc/sys/kernel/apparmor_restrict_unprivileged_userns /proc/sys/user/max_user_namespaces; do
+            if [ -r "$setting" ]; then printf "%s=" "$setting"; cat "$setting"; fi
+          done
       - name: Test API gateway
         run: node --test proxy.test.cjs
       - name: Build pinned production application

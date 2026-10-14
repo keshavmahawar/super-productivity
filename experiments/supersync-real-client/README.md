@@ -77,3 +77,9 @@ No GHCR image is implied by these sources. The authorized publisher must build, 
 ## CI runtime smoke
 
 After building `superproductivity-real-client:local`, run `bash smoke-container.sh`. This creates a disposable profile with no real account, enables container-loopback-only CDP solely for GUI testing, enables the API through the real UI, and checks native REST task creation/reload plus the noVNC page. It publishes no ports and does not disable Chromium sandboxing. Never set `CLIENT_DISPOSABLE_SMOKE` on a real profile. A successful smoke does not establish encrypted account interoperability.
+
+## Chromium namespace sandbox profile
+
+The client uses `seccomp-chromium.json`, derived from the unchanged Moby default at commit `6fe7deb1b9fb7c0397a4593480d7d22b9ee8caef`. The baseline is included as `seccomp-default.json`; the only added rule permits `clone`, `setns`, and `unshare`, following [Playwright’s Docker sandbox guidance](https://playwright.dev/docs/docker). The remaining syscall restrictions, including socket-family protections, are preserved. The profile applies only to the client container. Chromium remains sandboxed and non-root; no privileged mode, SYS_ADMIN capability, unconfined profile, or host sysctl change is used. Host AppArmor/user-namespace policies may independently prevent startup; do not weaken them automatically.
+
+Baseline: https://github.com/moby/profiles/blob/6fe7deb1b9fb7c0397a4593480d7d22b9ee8caef/seccomp/default.json
