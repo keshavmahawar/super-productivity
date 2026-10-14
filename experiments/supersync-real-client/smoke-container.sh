@@ -2,7 +2,20 @@
 set -euo pipefail
 name="sp-real-client-smoke-${RANDOM}"
 tmp=$(mktemp -d)
-cleanup() { docker logs "$name" 2>/dev/null || true; docker rm -f -v "$name" >/dev/null 2>&1 || true; rm -rf "$tmp"; }
+cleanup() {
+  result=$?
+  echo "Runtime smoke exit status: $result"
+  echo 'Container state before cleanup:'
+  docker inspect --format '{{json .State}}' "$name" 2>/dev/null || true
+  echo 'Container processes before cleanup:'
+  docker top "$name" -eo pid,ppid,stat,comm 2>/dev/null || true
+  echo 'Container logs:'
+  docker logs "$name" 2>&1 || true
+  echo 'Host memory:'
+  free -m || true
+  docker rm -f -v "$name" >/dev/null 2>&1 || true
+  rm -rf "$tmp"
+}
 trap cleanup EXIT
 # Disposable VNC fixture, no user account or real secrets.
 printf '%s\n' 'ci-test1' > "$tmp/password"
