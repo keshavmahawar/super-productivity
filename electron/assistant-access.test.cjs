@@ -50,7 +50,12 @@ test('initialize echoes a supported version and advertises tools only', async ()
   assert.deepEqual(reply.body.result, {
     protocolVersion: '2025-06-18',
     capabilities: { tools: {} },
-    serverInfo: { name: 'super-productivity', version: '1.2.3' },
+    serverInfo: {
+      name: 'super-productivity',
+      title: 'Super Productivity',
+      version: '1.2.3',
+      websiteUrl: 'https://super-productivity.com',
+    },
   });
 });
 
@@ -213,6 +218,37 @@ test('only granted tools are listed', () => {
   }
 });
 
+test('every tool has a title and explicit behaviour hints', () => {
+  const all = tools.listGrantedTools([...READ, 'tasks:read_notes', 'tasks:capture']);
+  for (const tool of all) {
+    assert.ok(tool.title, `${tool.name} needs a title`);
+    assert.equal(tool.annotations.title, tool.title);
+    for (const hint of [
+      'readOnlyHint',
+      'destructiveHint',
+      'idempotentHint',
+      'openWorldHint',
+    ]) {
+      assert.equal(typeof tool.annotations[hint], 'boolean', `${tool.name}.${hint}`);
+    }
+    assert.equal(tool.annotations.openWorldHint, false);
+    if (tool.annotations.readOnlyHint) {
+      assert.equal(tool.annotations.destructiveHint, false);
+    }
+  }
+  const readOnly = all.filter((t) => t.annotations.readOnlyHint).map((t) => t.name);
+  assert.deepEqual(readOnly, [
+    'get_status',
+    'list_tasks',
+    'get_task',
+    'list_projects',
+    'list_tags',
+  ]);
+  const capture = all.find((t) => t.name === 'create_task');
+  assert.equal(capture.annotations.destructiveHint, false);
+  assert.equal(capture.annotations.idempotentHint, false);
+});
+
 test('list_tasks returns summaries only and forwards filters', async () => {
   const { forward, calls } = fakeForward();
   const result = await tools.runTool(
@@ -346,6 +382,70 @@ test('create_task forwards a literal capture and reports the outcome', async () 
   assert.equal(calls[0].method, 'POST');
   assert.equal(calls[0].source, 'mcp');
   assert.deepEqual(calls[0].body, { title: 'Buy milk #shop', notes: 'n' });
+});
+
+test('create_task forwards dueDate, dueTime and repeat', async () => {
+  const { forward, calls } = fakeForward({
+    '/assistant/capture': () => ({
+      status: 200,
+      body: { ok: true, data: { status: 'created', id: 'new1' } },
+    }),
+  });
+  const args = {
+    title: 'Standup',
+    dueDate: '2026-11-02',
+    dueTime: '09:30',
+    repeat: { cycle: 'weekly', every: 2, weekdays: ['mon', 'thu'] },
+  };
+  const result = await tools.runTool(
+    'create_task',
+    args,
+    () => ['tasks:capture'],
+    forward,
+  );
+  assert.equal(result.isError, undefined);
+  assert.deepEqual(calls[0].body, args);
+});
+
+test('create_task rejects invalid dates and repeats before forwarding', async () => {
+  const cases = [
+    [{ dueTime: '09:00' }, 'dueTime requires dueDate'],
+    [{ dueDate: '2026-02-30' }, 'dueDate must be a calendar day as YYYY-MM-DD'],
+    [{ dueDate: '0999-01-01' }, 'dueDate must be a calendar day as YYYY-MM-DD'],
+    [
+      { dueDate: '2026-11-02', dueTime: '24:00' },
+      'dueTime must be a 24-hour time as HH:MM',
+    ],
+    [{ repeat: 'daily' }, 'repeat must be an object'],
+    [{ repeat: { cycle: 'daily', at: 1 } }, 'Unknown argument: repeat.at'],
+    [
+      { repeat: { cycle: 'hourly' } },
+      'repeat.cycle must be one of daily, weekly, monthly, yearly',
+    ],
+    [
+      { repeat: { cycle: 'daily', every: 0 } },
+      'repeat.every must be a whole number from 1 to 99',
+    ],
+    [
+      { repeat: { cycle: 'daily', weekdays: ['mon'] } },
+      'repeat.weekdays needs cycle weekly',
+    ],
+    [
+      { repeat: { cycle: 'weekly', weekdays: ['mon', 'mon'] } },
+      'repeat.weekdays must be distinct days out of mon, tue, wed, thu, fri, sat, sun',
+    ],
+  ];
+  for (const [extra, message] of cases) {
+    const { forward, calls } = fakeForward();
+    const result = await tools.runTool(
+      'create_task',
+      { title: 'x', ...extra },
+      () => ['tasks:capture'],
+      forward,
+    );
+    assert.equal(result.content[0].text, `INVALID_ARGUMENTS: ${message}`, message);
+    assert.equal(calls.length, 0);
+  }
 });
 
 test('create_task never claims nothing happened when the outcome is unknown', async () => {

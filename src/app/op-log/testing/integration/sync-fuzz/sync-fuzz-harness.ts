@@ -91,7 +91,10 @@ import {
 } from '../../../capture/operation-capture.meta-reducer';
 import { OperationCaptureService } from '../../../capture/operation-capture.service';
 import { OperationLogEffects } from '../../../capture/operation-log.effects';
-import { UnsupportedMultiEntityConflictError } from '../../../core/errors/sync-errors';
+import {
+  LocalDataConflictError,
+  UnsupportedMultiEntityConflictError,
+} from '../../../core/errors/sync-errors';
 import { MAX_LWW_REUPLOAD_RETRIES } from '../../../core/operation-log.const';
 import { PersistentAction } from '../../../core/persistent-action.interface';
 import {
@@ -111,6 +114,7 @@ import { TabSeqFrontierService } from '../../../persistence/tab-seq-frontier.ser
 import { ImmediateUploadService } from '../../../sync/immediate-upload.service';
 import { OperationLogDownloadService } from '../../../sync/operation-log-download.service';
 import { OperationLogSyncService } from '../../../sync/operation-log-sync.service';
+import { RemoteStateRebuildService } from '../../../sync/remote-state-rebuild.service';
 import { OperationWriteFlushService } from '../../../sync/operation-write-flush.service';
 import { RemoteOpsProcessingService } from '../../../sync/remote-ops-processing.service';
 import { RejectedOpsHandlerService } from '../../../sync/rejected-ops-handler.service';
@@ -120,12 +124,20 @@ import { countTransientRejections } from '../../../sync/upload-outcome.util';
 import { SyncProviderManager } from '../../../sync-providers/provider-manager.service';
 import { CLIENT_ID_PROVIDER } from '../../../util/client-id.provider';
 import { RepairOperationService } from '../../../validation/repair-operation.service';
+import { REMOTE_APPLY_LISTENER } from '../../../apply/remote-apply-listener.token';
+import { RecentlyDeletedService } from '../../../../features/tasks/recently-deleted/recently-deleted.service';
 import { RepairSyncContextService } from '../../../validation/repair-sync-context.service';
 import {
   FakeSuperSyncClient,
   FakeSuperSyncServer,
   FuzzUnsupportedTransportError,
 } from './fake-super-sync-server';
+import {
+  FileTransport,
+  FileTransportOptions,
+  TransportLog,
+} from './sync-fuzz-file-transport';
+import { OperationSyncCapable } from '../../../sync-providers/provider.interface';
 
 /**
  * Multi-device SuperSync harness on ONE Angular injector and ONE NgRx store.
@@ -165,7 +177,7 @@ import {
  * - state replacements: the force upload and the backup import run the real
  *   services, and a step answers the SYNC_IMPORT conflict dialog and the
  *   whole-dataset conflict dialog after a stop (DialogSyncConflictComponent,
- *   see _answerStopDialog; a stop left unanswered is its cancel). Not run:
+ *   see _answerDataConflict; a stop left unanswered is its cancel). Not run:
  *   cancelling the SYNC_IMPORT dialog as an answer, the
  *   server-migration confirm (closed unanswered), encryption changes and
  *   password changes (they need SyncWrapperService, the provider manager and
@@ -209,6 +221,7 @@ const DEVICE_FIELDS: ReadonlyArray<readonly [ProviderToken<object>, readonly str
       [
         'hasWarnedClockDrift',
         '_hasUnseenRemoteOps',
+        '_undecryptableRemoteOps',
         '_lastAnnouncedCheckpointSeq',
         'forcedDownloadCheckpoint',
         'clockDriftTimeoutId',
@@ -236,7 +249,7 @@ const DEVICE_FIELDS: ReadonlyArray<readonly [ProviderToken<object>, readonly str
     [OperationLogHydratorService, ['_migrationRanDuringHydration']],
     // Once-per-session latches: every device is its own app session.
     [RepairOperationService, ['_hasShownRepairSnackThisSession']],
-    [OperationLogSyncService, ['_hasWarnedRebuildVersionBlockThisSession']],
+    [RemoteStateRebuildService, ['_hasWarnedRebuildVersionBlockThisSession']],
     [
       RemoteOpsProcessingService,
       ['_hasWarnedVersionBlockThisSession', '_hasWarnedMigrationFailureThisSession'],
@@ -251,6 +264,9 @@ const SYNC_WINDOW =
 const APPLY_WINDOW =
   'the remote-apply window, which _settle checks is closed at every step boundary';
 const CONSTANT = 'a constant';
+const TRASH = 'the write-only device-local Recently deleted trash';
+const STORE_SIGNAL =
+  'a selector signal over the one Store, whose state is swapped per device';
 
 /**
  * In-memory service state that devices share on purpose, by class name and
@@ -261,6 +277,15 @@ const CONSTANT = 'a constant';
 const SHARED_FIELDS: Readonly<Record<string, Readonly<Record<string, string>>>> = {
   OperationLogStoreService: { _adapter: ROUTED, _db: ROUTED, _initPromise: ROUTED },
   ArchiveStoreService: { _adapter: ROUTED, _db: ROUTED, _initPromise: ROUTED },
+  // The Recently deleted trash is device-local and write-only here: no reducer,
+  // sync path or oracle reads it, so devices sharing it changes nothing compared.
+  RecentlyDeletedService: {
+    _queue: TRASH,
+    _isPurgedThisSession: TRASH,
+    _taskEntities: STORE_SIGNAL,
+    _projectState: STORE_SIGNAL,
+  },
+  RecentlyDeletedStoreService: { _dbPromise: TRASH },
   OperationLogEffects: {
     isHandlingQuotaExceeded:
       'set only on a storage-quota error, which the fuzz never hits',
@@ -268,6 +293,10 @@ const SHARED_FIELDS: Readonly<Record<string, Readonly<Record<string, string>>>> 
       'set only on a storage-quota error, which the fuzz never hits',
     STORAGE_QUOTA_SNACK_DEDUPE_MS: CONSTANT,
     _deferredProcessingChain: 'settled at every step boundary: _settle drains it',
+  },
+  ArchiveOperationHandler: {
+    _localQueue:
+      'settled at every step boundary: _settle waits for every queued local operation',
   },
   OperationCaptureService: { PENDING_WARNING_THRESHOLD: CONSTANT },
   OperationLogMigrationService: { completionDisplayMs: CONSTANT },
@@ -379,7 +408,7 @@ export interface FuzzDevice {
    */
   clientId: string;
   clientIdStale?: boolean;
-  readonly client: FakeSuperSyncClient;
+  readonly client: OperationSyncCapable;
   readonly db: IndexedDbOpLogAdapter;
   state: object;
   fields?: FieldValues;
@@ -395,7 +424,8 @@ export type FuzzEventKind =
   | 'lww-retries-exhausted'
   | 'dialog'
   | 'import-dialog' // the SYNC_IMPORT conflict dialog, answered by the step (`k`)
-  | 'stop-dialog' // the whole-dataset dialog after a `stop`, answered by the step (`k`)
+  | 'data-conflict' // a local data conflict whose dialog the step answers: counted, not a failure
+  | 'stop-dialog' // the whole-dataset dialog after a `stop` or a `data-conflict`, answered by the step (`k`)
   | 'error-snack'
   | 'dev-error';
 
@@ -455,6 +485,8 @@ export class SyncFuzzHarness {
   private static _generation = 0;
   private readonly _generation = ++SyncFuzzHarness._generation;
   readonly server: FakeSuperSyncServer;
+  /** Set for a run that syncs through the file-based adapter instead of `server`. */
+  readonly fileTransport?: FileTransport;
   readonly devices: FuzzDevice[] = [];
   readonly events: FuzzEvent[] = [];
   /**
@@ -472,8 +504,9 @@ export class SyncFuzzHarness {
   importDialogAnswer?: ImportDialogAnswer;
   /**
    * The user's answer to the whole-dataset conflict dialog
-   * (DialogSyncConflictComponent) after a multi-entity stop, while it is set.
-   * Unset, the stop is all that happens, as before the dialog was modeled.
+   * (DialogSyncConflictComponent) after a multi-entity stop or a local data
+   * conflict, while it is set. Unset, the stop or the conflict's sync error
+   * is all that happens, as before the dialog was modeled.
    */
   stopDialogAnswer?: ImportDialogAnswer;
   /**
@@ -490,7 +523,13 @@ export class SyncFuzzHarness {
   private _pristineFields!: FieldValues;
   private readonly _deviceFieldNames = new Map<object, ReadonlySet<string>>();
 
-  private constructor() {
+  /** The ops on the wire of whichever transport the run uses. */
+  get wire(): TransportLog {
+    return this.fileTransport?.log ?? this.server;
+  }
+
+  private constructor(fileTransport?: FileTransportOptions) {
+    if (fileTransport) this.fileTransport = new FileTransport(fileTransport);
     // Local noon of the real day: a run never crosses midnight, in any time
     // zone, and its "today" matches `new Date()` in app code.
     const noon = new Date();
@@ -542,8 +581,8 @@ export class SyncFuzzHarness {
   }
 
   /** Configures TestBed; call from an `it`/`beforeEach` with a fresh module. */
-  static async create(): Promise<SyncFuzzHarness> {
-    const harness = new SyncFuzzHarness();
+  static async create(fileTransport?: FileTransportOptions): Promise<SyncFuzzHarness> {
+    const harness = new SyncFuzzHarness(fileTransport);
     harness._configure();
     await harness._init();
     return harness;
@@ -644,6 +683,8 @@ export class SyncFuzzHarness {
       providers: [
         { provide: OP_LOG_DB_ADAPTER_FACTORY, useValue: () => routingAdapter },
         { provide: CLIENT_ID_PROVIDER, useValue: clientIds },
+        // As in main.ts, so remote applies also run the trash's hook.
+        { provide: REMOTE_APPLY_LISTENER, useExisting: RecentlyDeletedService },
         { provide: ClientIdService, useValue: clientIds },
         { provide: ImmediateUploadService, useValue: { trigger: () => undefined } },
         {
@@ -692,6 +733,9 @@ export class SyncFuzzHarness {
     // not end, and the device swap out, before they wrote to this device's
     // database.
     this._trackInFlight(TestBed.inject(ArchiveOperationHandler), 'handleOperation');
+    // A queued local archive write is in flight from the moment it is queued,
+    // not only once it starts.
+    this._trackInFlight(TestBed.inject(ArchiveOperationHandler), 'enqueueLocalOperation');
     this._trackInFlight(TestBed.inject(OperationLogCompactionService), 'compact');
     this._trackInFlight(
       TestBed.inject(OperationLogCompactionService),
@@ -751,7 +795,9 @@ export class SyncFuzzHarness {
     const device: FuzzDevice = {
       name,
       clientId: `fuzzDev${name}`,
-      client: new FakeSuperSyncClient(this.server),
+      client: this.fileTransport
+        ? this.fileTransport.createClient(TestBed.inject(EnvironmentInjector))
+        : new FakeSuperSyncClient(this.server),
       db,
       state: this._pristineState,
     };
@@ -945,7 +991,14 @@ export class SyncFuzzHarness {
           const message = e instanceof Error ? e.message : String(e);
           if (e instanceof UnsupportedMultiEntityConflictError) {
             this.record(device, 'stop', message);
-            await this._answerStopDialog(device, syncService, session);
+            await this._answerDataConflict(device, syncService, session);
+          } else if (e instanceof LocalDataConflictError && this.stopDialogAnswer) {
+            // The app raises this one itself, like the stop: a remote
+            // snapshot over unsynced changes (file sync), or first remote ops
+            // on a never-synced device with data. Answered, it is not a
+            // failure: what the answer drops is judged instead.
+            this.record(device, 'data-conflict', message);
+            await this._answerDataConflict(device, syncService, session);
           } else if (e instanceof FuzzUnsupportedTransportError) {
             this.record(device, 'full-state', message);
           } else {
@@ -1031,15 +1084,16 @@ export class SyncFuzzHarness {
   }
 
   /**
-   * The whole-dataset conflict dialog after a multi-entity stop, answered
-   * with `stopDialogAnswer` as SyncWrapperService._handleDataConflict acts on
-   * it, inside the same sync session. A background sync only offers the
+   * The whole-dataset conflict dialog, answered as
+   * SyncWrapperService._handleDataConflict acts on it, inside the same sync
+   * session, after a multi-entity stop or a local data conflict
+   * (LocalDataConflictError). A background sync only offers the
    * dialog through a snack whose button runs a user-triggered sync, which
    * opens the dialog if it stops again; the harness answers at the first
    * stop, so it never sees another device upload in between. Unset, the
    * dialog stays unanswered: the device keeps its stop.
    */
-  private async _answerStopDialog(
+  private async _answerDataConflict(
     device: FuzzDevice,
     syncService: OperationLogSyncService,
     session: SyncSessionValidationService,

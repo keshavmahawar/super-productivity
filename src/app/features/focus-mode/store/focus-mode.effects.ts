@@ -22,8 +22,12 @@ import { FocusModeStrategyFactory } from '../focus-mode-strategies';
 import { GlobalConfigService } from '../../config/global-config.service';
 import { TaskService } from '../../tasks/task.service';
 import { playSound } from '../../../util/play-sound';
-import { startWhiteNoise, stopWhiteNoise } from '../../../util/white-noise';
-import { startBreakEndAlarm, stopBreakEndAlarm } from '../../../util/break-end-alarm';
+import {
+  setWhiteNoiseVolume,
+  startWhiteNoise,
+  stopWhiteNoise,
+} from '../../../util/white-noise';
+import { startLoopingAlarm, stopLoopingAlarm } from '../../../util/looping-alarm';
 import { FocusModeLocalSettingsService } from '../../config/focus-mode-local-settings.service';
 import { IS_ELECTRON, IS_ELECTRON_TOKEN } from '../../../app.constants';
 import { setCurrentTask, unsetCurrentTask } from '../../tasks/store/task.actions';
@@ -32,11 +36,17 @@ import { openIdleDialog } from '../../idle/store/idle.actions';
 import { LS } from '../../../core/persistence/storage-keys.const';
 import {
   selectFocusModeConfig,
+  selectSoundConfig,
   selectIsFocusModeEnabled,
   selectPomodoroConfig,
 } from '../../config/store/global-config.reducer';
 import { updateGlobalConfigSection } from '../../config/store/global-config.actions';
-import { FocusModeMode, FocusScreen, getBreakCycle } from '../focus-mode.model';
+import {
+  FocusModeMode,
+  FocusScreen,
+  getBreakCycle,
+  getFocusModeSoundVolume,
+} from '../focus-mode.model';
 import { MetricService } from '../../metric/metric.service';
 import { FocusModeStorageService } from '../focus-mode-storage.service';
 import { TakeABreakService } from '../../take-a-break/take-a-break.service';
@@ -44,13 +54,12 @@ import { NotifyService } from '../../../core/notify/notify.service';
 import { msToString } from '../../../ui/duration/ms-to-string.pipe';
 import { T } from '../../../t.const';
 import { IS_ANDROID_WEB_VIEW_TOKEN } from '../../../util/is-android-web-view';
+import { CapacitorPlatformService } from '../../../core/platform/capacitor-platform.service';
 import { BannerService } from '../../../core/banner/banner.service';
 import { BannerId } from '../../../core/banner/banner.model';
 
 const SESSION_DONE_SOUND = 'positive.mp3';
 const TICK_SOUND = 'tick.mp3';
-/** Focus-mode ambient sounds play at 40% of the user's main volume to avoid being intrusive. */
-const FOCUS_SOUND_VOLUME_FACTOR = 0.4;
 
 @Injectable()
 export class FocusModeEffects {
@@ -66,7 +75,9 @@ export class FocusModeEffects {
   private notifyService = inject(NotifyService);
   private bannerService = inject(BannerService);
   private isAndroidWebView = inject(IS_ANDROID_WEB_VIEW_TOKEN);
+  private isIosNative = inject(CapacitorPlatformService).isIOS();
   private focusModeLocalSettingsService = inject(FocusModeLocalSettingsService);
+  private _breakEndAlarm: Promise<number> | null = null;
 
   // Sync: When tracking starts → resume/skip-break or auto-spawn a new session.
   //
@@ -322,7 +333,7 @@ export class FocusModeEffects {
   // lifecycle, so any leave-break transition (completeBreak / skipBreak /
   // starting the next session — all of which flip timer.purpose away from
   // 'break' or set it running again) naturally stops the loop via
-  // distinctUntilChanged. A hard safety ceiling inside startBreakEndAlarm()
+  // distinctUntilChanged. A hard safety ceiling inside startLoopingAlarm()
   // stops it regardless if the user truly walked away.
   breakEndAlarmSound$ = createEffect(
     () =>
@@ -337,9 +348,10 @@ export class FocusModeEffects {
         tap((shouldAlarm) => {
           if (shouldAlarm) {
             const soundVolume = this.globalConfigService.sound()?.volume || 0;
-            startBreakEndAlarm(SESSION_DONE_SOUND, soundVolume);
+            this._breakEndAlarm = startLoopingAlarm(SESSION_DONE_SOUND, soundVolume);
           } else {
-            stopBreakEndAlarm();
+            this._breakEndAlarm?.then(stopLoopingAlarm);
+            this._breakEndAlarm = null;
           }
         }),
       ),
@@ -530,7 +542,10 @@ export class FocusModeEffects {
   // banner/overlay + desktop window flash are alert enough, and it would fire
   // spuriously on idle-resume) and on Android, where the native foreground
   // service already posts its own completion notification (see
-  // FocusModeForegroundService.onTimerComplete), so this would duplicate.
+  // FocusModeForegroundService.onTimerComplete), so this would duplicate. iOS
+  // is skipped for the same reason: FocusModeIosNotificationEffects schedules
+  // the completion notification up front, and this effect only runs once the
+  // app is open again.
   surfaceSessionDoneOnCompletion$ = createEffect(
     () =>
       this.actions$.pipe(
@@ -542,7 +557,7 @@ export class FocusModeEffects {
         ),
         filter(([action, mode]) => mode === FocusModeMode.Countdown && !action.isManual),
         tap(([_action, _mode, duration, isOverlayShown]) => {
-          if (!document.hasFocus() && !this.isAndroidWebView) {
+          if (!document.hasFocus() && !this.isAndroidWebView && !this.isIosNative) {
             this.notifyService.notify({
               title: T.F.FOCUS_MODE.SESSION_COMPLETED,
               body: T.F.FOCUS_MODE.SESSION_COMPLETED_NOTIFICATION_BODY,
@@ -925,9 +940,12 @@ export class FocusModeEffects {
         ),
         withLatestFrom(this.store.select(selectFocusModeConfig)),
         tap(([, focusModeConfig]) => {
-          const soundVolume = this.globalConfigService.sound()?.volume || 0;
-          if (focusModeConfig?.focusModeSound === 'tick' && soundVolume > 0) {
-            playSound(TICK_SOUND, Math.round(soundVolume * FOCUS_SOUND_VOLUME_FACTOR));
+          const volume = getFocusModeSoundVolume(
+            this.globalConfigService.sound()?.volume,
+            focusModeConfig?.focusModeSoundVolume,
+          );
+          if (focusModeConfig?.focusModeSound === 'tick' && volume > 0) {
+            playSound(TICK_SOUND, volume);
           }
         }),
       ),
@@ -940,25 +958,33 @@ export class FocusModeEffects {
       combineLatest([
         this.store.select(selectors.selectTimer),
         this.store.select(selectFocusModeConfig),
+        this.store.select(selectSoundConfig),
       ]).pipe(
         skipWhileApplyingRemoteOps(),
-        map(([timer, focusModeConfig]) => {
-          const soundVolume = this.globalConfigService.sound()?.volume || 0;
-          return (
+        // 0 = not playing; a changed non-zero value only adjusts the running loop
+        map(([timer, focusModeConfig, soundConfig]) => {
+          const isActive =
             focusModeConfig?.focusModeSound === 'whiteNoise' &&
             timer.isRunning &&
             timer.purpose === 'work' &&
-            timer.elapsed > 0 &&
-            soundVolume > 0
-          );
+            timer.elapsed > 0;
+          return isActive
+            ? getFocusModeSoundVolume(
+                soundConfig?.volume,
+                focusModeConfig?.focusModeSoundVolume,
+              )
+            : 0;
         }),
         distinctUntilChanged(),
-        tap((shouldPlay) => {
-          if (shouldPlay) {
-            const soundVolume = this.globalConfigService.sound()?.volume || 0;
-            startWhiteNoise(Math.round(soundVolume * FOCUS_SOUND_VOLUME_FACTOR));
-          } else {
+        startWith(0),
+        pairwise(),
+        tap(([prevVolume, volume]) => {
+          if (volume === 0) {
             stopWhiteNoise();
+          } else if (prevVolume === 0) {
+            startWhiteNoise(volume);
+          } else {
+            setWhiteNoiseVolume(volume);
           }
         }),
       ),

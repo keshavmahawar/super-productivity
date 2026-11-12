@@ -317,9 +317,6 @@ export class GlobalThemeService {
 
   private _setDarkTheme(isDarkTheme: boolean): void {
     this._materialCssVarsService.setDarkTheme(isDarkTheme);
-    this._setChartTheme(isDarkTheme).catch((err) => {
-      Log.warn('Failed to set chart theme', err);
-    });
     // this._materialCssVarsService.setDarkTheme(true);
     // this._materialCssVarsService.setDarkTheme(false);
   }
@@ -623,39 +620,6 @@ export class GlobalThemeService {
     }
   }
 
-  private async _setChartTheme(isDarkTheme: boolean): Promise<void> {
-    const { ThemeService } = await import('ng2-charts');
-
-    const chartThemeService = this._environmentInjector.get(ThemeService);
-
-    const overrides: import('chart.js').ChartConfiguration['options'] = isDarkTheme
-      ? {
-          scales: {
-            x: {
-              ticks: {
-                color: 'white',
-              },
-              grid: {
-                color: 'rgba(255,255,255,0.1)',
-              },
-            },
-
-            y: {
-              ticks: {
-                color: 'white',
-              },
-              grid: {
-                color: 'rgba(255,255,255,0.1)',
-              },
-            },
-          },
-        }
-      : {
-          scales: {},
-        };
-    chartThemeService.setColorschemesOptions(overrides);
-  }
-
   /**
    * Keyboard-height tracking via VisualViewport — the fallback path for any
    * non-iOS touch build (Capacitor Android, F-Droid, mobile-web).
@@ -753,17 +717,16 @@ export class GlobalThemeService {
     // built-in SystemBars). The --safe-area-inset-* vars are no longer written
     // from JS on Android — that would race SystemBars on the same documentElement
     // inline style (last-writer-wins, OS/timing dependent). Each band resolves
-    // them on its own (verified against the bundled SystemBars.java):
-    //   - API >= 35: SystemBars *injects* the real px into --safe-area-inset-*.
-    //   - WebView >= 140 (any API): SystemBars passes the native insets through,
-    //     so the WebView's own env(safe-area-inset-*) is correct (no injection
-    //     below API 35).
-    //   - WebView < 140 / API < 35 tail: SystemBars does nothing here.
+    // them on its own (verified against the bundled SystemBars.java, Capacitor
+    // 8.5.3 — see docs/android-edge-to-edge-keyboard.md, "Capacitor 8.5.2+"):
+    //   - WebView >= 140 (any API, viewport-fit=cover): SystemBars passes the
+    //     native insets through and mirrors them into --safe-area-inset-*
+    //     (bottom 0px while the keyboard is up, which it pads natively).
+    //   - WebView < 140 (any API): SystemBars pads the window natively for the
+    //     system bars and keyboard and writes 0px into --safe-area-inset-*.
     // In every case the SCSS fallback `var(--safe-area-inset-*, env(...))` in
     // _css-variables.scss resolves to the injected px when present, else to
-    // env(). With viewport-fit=cover env(safe-area-inset-top) equals the
-    // status-bar height when the WebView extends under it — exactly the #8283 top
-    // fallback, preserved automatically by not pinning the var here.
+    // env() — which covers the moment before SystemBars' first write.
     // Only iOS (contentInset: 'never') still needs JS-fed insets from
     // capacitor-plugin-safe-area; SystemBars insetsHandling is Android-only.
     if (!this._platformService.isAndroid()) {

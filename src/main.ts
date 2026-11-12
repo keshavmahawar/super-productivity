@@ -23,7 +23,6 @@ import { IS_ANDROID_WEB_VIEW } from './app/util/is-android-web-view';
 import { androidInterface } from './app/features/android/android-interface';
 import { AndroidBackButtonService } from './app/features/android/android-back-button.service';
 import { IS_IOS_NATIVE, IS_NATIVE_PLATFORM } from './app/util/is-native-platform';
-import { DataInitStateService } from './app/core/data-init/data-init-state.service';
 // Type definitions for window.ea are in ./app/core/window-ea.d.ts
 import { App as CapacitorApp } from '@capacitor/app';
 import { GlobalErrorHandler } from './app/core/error-handler/global-error-handler.class';
@@ -41,8 +40,10 @@ import {
 import { MarkdownModule, MARKED_OPTIONS, SANITIZE } from 'ngx-markdown';
 import { MAT_FORM_FIELD_DEFAULT_OPTIONS } from '@angular/material/form-field';
 import { MAT_DIALOG_DEFAULT_OPTIONS } from '@angular/material/dialog';
-import { IS_TOUCH_PRIMARY } from './app/util/is-mouse-primary';
+import { createDialogDefaultOptions } from './app/util/dialog-auto-focus';
 import { FeatureStoresModule } from './app/root-store/feature-stores.module';
+import { REMOTE_APPLY_LISTENER } from './app/op-log/apply/remote-apply-listener.token';
+import { RecentlyDeletedService } from './app/features/tasks/recently-deleted/recently-deleted.service';
 import {
   MATERIAL_ANIMATIONS,
   MatNativeDateModule,
@@ -62,12 +63,7 @@ import { MatSidenavModule } from '@angular/material/sidenav';
 import { MatBottomSheetModule } from '@angular/material/bottom-sheet';
 import { ReminderModule } from './app/features/reminder/reminder.module';
 import { provideAnimationsAsync } from '@angular/platform-browser/animations/async';
-import {
-  PreloadAllModules,
-  provideRouter,
-  withHashLocation,
-  withPreloading,
-} from '@angular/router';
+import { provideRouter, withHashLocation, withPreloading } from '@angular/router';
 import { APP_ROUTES } from './app/app.routes';
 import { StoreModule, Store } from '@ngrx/store';
 import { META_REDUCERS } from './app/root-store/meta/meta-reducer-registry';
@@ -93,12 +89,16 @@ import { initializeMatMenuTouchFix } from './app/features/tasks/task-context-men
 import { Log, SyncLog } from './app/core/log';
 import { setLegacyKdfWarningHandler } from '@sp/sync-core';
 import { OperationWriteFlushService } from './app/op-log/sync/operation-write-flush.service';
+import { BackgroundExitSyncService } from './app/imex/sync/background-exit-sync.service';
+import { handleIosBackground } from './app/features/ios/handle-ios-background';
 import { TaskService } from './app/features/tasks/task.service';
-import { LocalRestApiFeatureBridgeService } from './app/features/tasks/local-rest-api-feature-bridge.service';
-import { LOCAL_REST_API_FEATURE_BRIDGE } from './app/core/electron/local-rest-api-feature-bridge';
 import { LOCAL_REST_API_FEATURE_ROUTES } from './app/core/electron/local-rest-api-feature-routes';
+import { LocalRestApiTaskRoutesService } from './app/features/tasks/local-rest-api-task-routes.service';
+import { LocalRestApiFocusRoutesService } from './app/features/focus-mode/local-rest-api-focus-routes.service';
 import { LocalRestApiTaskRepeatCfgRoutesService } from './app/features/task-repeat-cfg/local-rest-api-task-repeat-cfg-routes.service';
 import { LocalRestApiAssistantCaptureRoutesService } from './app/features/tasks/assistant-capture/local-rest-api-assistant-capture-routes.service';
+import { LocalRestApiNoteRoutesService } from './app/features/note/local-rest-api-note-routes.service';
+import { LocalRestApiSimpleCounterRoutesService } from './app/features/simple-counter/local-rest-api-simple-counter-routes.service';
 import { PluginOAuthRedirectHandler } from './app/plugins/oauth/plugin-oauth-redirect.handler';
 import { OAuthCallbackHandlerService } from './app/imex/sync/oauth-callback-handler.service';
 import { GlobalConfigService } from './app/features/config/global-config.service';
@@ -110,6 +110,10 @@ import { suspendAudioContext, unlockAudioContext } from './app/util/audio-contex
 import { NetworkRetryInterceptorService } from './app/core/http/network-retry-interceptor.service';
 import { routeCapacitorAppUrl } from './app/core/app-url-open-router';
 import { AppUriQuickActionsService } from './app/core-ui/app-uri-actions/app-uri-quick-actions.service';
+import { markBoot, reportBootTimingsOnFirstRender } from './app/core/startup/boot-timing';
+import { IdlePreloadingStrategy } from './app/core/startup/idle-preloading-strategy';
+
+markBoot('main-start');
 
 if (environment.production || environment.stage) {
   enableProdMode();
@@ -151,6 +155,7 @@ bootstrapApplication(AppComponent, {
     // timeout, so a failed or stalled chunk load degrades to the default locale
     // instead of failing bootstrap or holding up first render indefinitely.
     provideAppInitializer(() => registerNavigatorLocale()),
+    provideAppInitializer(() => reportBootTimingsOnFirstRender()),
     // Feature-owned formly types, registered here rather than in ui/'s
     // FormlyConfigModule so ui/ does not import from features/.
     provideFormlyConfig(PRIORITY_ICON_PRESET_SELECT_FORMLY_CONFIG),
@@ -208,7 +213,7 @@ bootstrapApplication(AppComponent, {
       EffectsModule.forRoot([]),
       // StoreDevtoolsModule lazy-loaded in dev mode after bootstrap
       ReactiveFormsModule,
-      ServiceWorkerModule.register('ngsw-worker.js', {
+      ServiceWorkerModule.register('sw.js', {
         enabled:
           !IS_ELECTRON &&
           !IS_NATIVE_PLATFORM &&
@@ -216,6 +221,10 @@ bootstrapApplication(AppComponent, {
         // Register the ServiceWorker as soon as the application is stable
         // or after 30 seconds (whichever comes first).
         registrationStrategy: 'registerWhenStable:30000',
+        // sw.js loads ngsw-worker.js via importScripts; without this, update
+        // checks may take that import from the HTTP cache. Keep in sync with
+        // the register() call below, or each call flips the registration.
+        updateViaCache: 'none',
       }),
       TranslateModule.forRoot({
         fallbackLang: DEFAULT_LANGUAGE,
@@ -238,9 +247,16 @@ bootstrapApplication(AppComponent, {
     ShortTimePipe,
     { provide: DateAdapter, useClass: CustomDateAdapter },
     { provide: MatDatepickerIntl, useClass: TranslateMatDatepickerIntl },
+    { provide: REMOTE_APPLY_LISTENER, useExisting: RecentlyDeletedService },
     {
-      provide: LOCAL_REST_API_FEATURE_BRIDGE,
-      useClass: LocalRestApiFeatureBridgeService,
+      provide: LOCAL_REST_API_FEATURE_ROUTES,
+      useClass: LocalRestApiTaskRoutesService,
+      multi: true,
+    },
+    {
+      provide: LOCAL_REST_API_FEATURE_ROUTES,
+      useClass: LocalRestApiFocusRoutesService,
+      multi: true,
     },
     {
       provide: LOCAL_REST_API_FEATURE_ROUTES,
@@ -250,6 +266,16 @@ bootstrapApplication(AppComponent, {
     {
       provide: LOCAL_REST_API_FEATURE_ROUTES,
       useClass: LocalRestApiAssistantCaptureRoutesService,
+      multi: true,
+    },
+    {
+      provide: LOCAL_REST_API_FEATURE_ROUTES,
+      useClass: LocalRestApiNoteRoutesService,
+      multi: true,
+    },
+    {
+      provide: LOCAL_REST_API_FEATURE_ROUTES,
+      useClass: LocalRestApiSimpleCounterRoutesService,
       multi: true,
     },
     {
@@ -281,10 +307,9 @@ bootstrapApplication(AppComponent, {
       provide: MAT_FORM_FIELD_DEFAULT_OPTIONS,
       useValue: { appearance: 'fill', subscriptSizing: 'dynamic' },
     },
-    // Disable autofocus for touch-primary devices to prevent virtual keyboard popup
-    ...(IS_TOUCH_PRIMARY
-      ? [{ provide: MAT_DIALOG_DEFAULT_OPTIONS, useValue: { autoFocus: false } }]
-      : []),
+    // On touch, dialogs focus their container instead of their first field so
+    // the on-screen keyboard does not cover them (see dialog-auto-focus.ts).
+    { provide: MAT_DIALOG_DEFAULT_OPTIONS, useValue: createDialogDefaultOptions() },
     provideAnimationsAsync(),
     // Keep component <style> elements once added. Removing them when the last
     // instance is destroyed means every snack and dialog adds its stylesheets on
@@ -302,7 +327,7 @@ bootstrapApplication(AppComponent, {
         },
       }),
     },
-    provideRouter(APP_ROUTES, withHashLocation(), withPreloading(PreloadAllModules)),
+    provideRouter(APP_ROUTES, withHashLocation(), withPreloading(IdlePreloadingStrategy)),
     PLUGIN_INITIALIZER_PROVIDER,
     provideZonelessChangeDetection(),
     // Initialize operation capture service for synchronous state change capture
@@ -407,6 +432,7 @@ bootstrapApplication(AppComponent, {
     // race condition where upload attempts happen before sync config is loaded
   ],
 }).then((appRef) => {
+  markBoot('bootstrapped');
   appInjector = appRef.injector;
 
   // Expose store and persistence helpers for E2E tests in non-production builds.
@@ -427,15 +453,6 @@ bootstrapApplication(AppComponent, {
           return appRef.injector.get(OperationLogCompactionService).compact();
         },
       };
-    });
-  }
-
-  // Dismiss native startup overlay after all data is loaded (Android only)
-  if (IS_ANDROID_WEB_VIEW) {
-    appRef.injector.get(DataInitStateService).isAllDataLoadedInitially$.subscribe(() => {
-      import('./app/core/startup-overlay/startup-overlay.service').then((m) => {
-        appRef.injector.get(m.StartupOverlayService).processAndDismiss();
-      });
     });
   }
 
@@ -463,12 +480,21 @@ bootstrapApplication(AppComponent, {
   // focus button), which cannot happen before idle callback fires. Restoring a
   // session killed in the background waits for data load, so it is not raced either.
   const registerLazyEffects = async (): Promise<void> => {
-    const [{ FocusModeEffects }, sessionPersistence] = await Promise.all([
-      import('./app/features/focus-mode/store/focus-mode.effects'),
-      IS_IOS_NATIVE
-        ? import('./app/features/focus-mode/store/focus-mode-session-persistence.effects')
-        : null,
-    ]);
+    const [{ FocusModeEffects }, webNotification, sessionPersistence, iosNotification] =
+      await Promise.all([
+        import('./app/features/focus-mode/store/focus-mode.effects'),
+        // Web only: desktop and mobile alert through their own paths (#7550)
+        !IS_ELECTRON && !IS_NATIVE_PLATFORM
+          ? import('./app/features/focus-mode/store/focus-mode-web-notification.effects')
+          : null,
+        IS_IOS_NATIVE
+          ? import('./app/features/focus-mode/store/focus-mode-session-persistence.effects')
+          : null,
+        // iOS only: the suspended WebView cannot announce a session end (#8398)
+        IS_IOS_NATIVE
+          ? import('./app/features/focus-mode/store/focus-mode-ios-notification.effects')
+          : null,
+      ]);
     const envInjector = appRef.injector.get(EnvironmentInjector);
     createEnvironmentInjector(
       [
@@ -479,9 +505,11 @@ bootstrapApplication(AppComponent, {
           // on desktop a closed app means the user ended the session.
           EffectsModule.forFeature([
             FocusModeEffects,
+            ...(webNotification ? [webNotification.FocusModeWebNotificationEffects] : []),
             ...(sessionPersistence
               ? [sessionPersistence.FocusModeSessionPersistenceEffects]
               : []),
+            ...(iosNotification ? [iosNotification.FocusModeIosNotificationEffects] : []),
           ]),
         ),
       ],
@@ -541,10 +569,12 @@ bootstrapApplication(AppComponent, {
     !IS_NATIVE_PLATFORM
   ) {
     Log.log('Registering Service worker');
-    return navigator.serviceWorker.register('ngsw-worker.js').catch((err: unknown) => {
-      Log.log('Service Worker Registration Error');
-      Log.err(err);
-    });
+    return navigator.serviceWorker
+      .register('sw.js', { updateViaCache: 'none' })
+      .catch((err: unknown) => {
+        Log.log('Service Worker Registration Error');
+        Log.err(err);
+      });
   } else if ('serviceWorker' in navigator && (IS_ELECTRON || IS_NATIVE_PLATFORM)) {
     navigator.serviceWorker
       .getRegistrations()
@@ -624,8 +654,13 @@ if (IS_ANDROID_WEB_VIEW) {
   });
 }
 
-// iOS: Flush pending operations to IndexedDB when app goes to background.
+// iOS: persist and push pending ops when the app leaves the foreground.
+// A suspended app leaves its ops invisible to other devices until reopened.
 if (IS_IOS_NATIVE) {
+  // appStateChange, not `pause` (didEnterBackground): it fires first, on
+  // willResignActive, so the budget is requested before iOS can suspend the
+  // WebView. It also fires for Control Center and the notification shade; the
+  // push skips when no op is unsynced, so those usually cost no sync.
   CapacitorApp.addListener('appStateChange', async ({ isActive }) => {
     if (isActive) {
       return;
@@ -633,18 +668,18 @@ if (IS_IOS_NATIVE) {
     // Release the audio output stream so a silent-but-running AudioContext does
     // not keep the audio hardware (and the process) awake in the background (#8243).
     suspendAudioContext();
-    const taskId = await BackgroundTask.beforeExit(async () => {
-      try {
+    const taskId = await BackgroundTask.beforeExit(() =>
+      handleIosBackground({
         // Dispatch any accumulated tracked time so it is enqueued before the
-        // op-log drain below. iOS suspends the WebView seconds after this, so
-        // both the dispatch and the persist must happen inside this budget.
-        appInjector?.get(TaskService).flushAccumulatedTimeSpent();
-        await flushPendingOperations('iOS');
-      } catch (e) {
-        Log.err('iOS background: operation flush failed', e);
-      }
-      BackgroundTask.finish({ taskId });
-    });
+        // op-log drain inside the push. iOS suspends the WebView seconds after
+        // this, so the dispatch, persist and push must happen inside this budget.
+        flushAccumulatedTimeSpent: () =>
+          appInjector?.get(TaskService).flushAccumulatedTimeSpent(),
+        pushPendingOps: async () =>
+          appInjector?.get(BackgroundExitSyncService).flushAndPush(),
+        finish: () => BackgroundTask.finish({ taskId }),
+      }),
+    );
   });
 }
 

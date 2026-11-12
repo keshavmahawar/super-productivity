@@ -81,12 +81,13 @@ const postJson = (
 const callCreateTask = async (
   token: string,
   title: string,
+  extraArgs: Record<string, unknown> = {},
 ): Promise<{ isError?: boolean; content: Array<{ text: string }> }> => {
   const response = await postJson('/mcp', token, {
     jsonrpc: '2.0',
     id: 1,
     method: 'tools/call',
-    params: { name: 'create_task', arguments: { title } },
+    params: { name: 'create_task', arguments: { title, ...extraArgs } },
   });
   expect(response.status).toBe(200);
   const body = (await response.json()) as {
@@ -95,9 +96,115 @@ const callCreateTask = async (
   return body.result;
 };
 
-const captureTask = async (token: string, title: string): Promise<void> => {
-  expect((await callCreateTask(token, title)).isError).toBeFalsy();
+const captureTask = async (
+  token: string,
+  title: string,
+  extraArgs: Record<string, unknown> = {},
+): Promise<void> => {
+  expect((await callCreateTask(token, title, extraArgs)).isError).toBeFalsy();
 };
+
+const toDbDateStr = (d: Date): string =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(
+    d.getDate(),
+  ).padStart(2, '0')}`;
+
+/** The first given weekday (0 = Sunday) at least two days ahead: never today. */
+const nextWeekday = (weekday: number): string => {
+  const d = new Date();
+  // Midday, so a DST transition cannot shift the day while stepping.
+  d.setHours(12, 0, 0, 0);
+  d.setDate(d.getDate() + 2);
+  while (d.getDay() !== weekday) d.setDate(d.getDate() + 1);
+  return toDbDateStr(d);
+};
+
+interface CapturedSchedule {
+  dueDay: string | null;
+  dueWithTime: number | null;
+  /** `dueWithTime` expected for the given local day and time, in the page's zone. */
+  expectedDueWithTime: number | null;
+  hasRemindAt: boolean;
+  repeat: {
+    repeatCycle: string;
+    repeatEvery: number;
+    startTime: string | null;
+    weekdays: string[];
+  } | null;
+}
+
+/** The persisted schedule of the task with this title, read from the store. */
+const getCapturedSchedule = (
+  page: Page,
+  title: string,
+  expected: { day: string; time: string } | null,
+): Promise<CapturedSchedule | null> =>
+  page.evaluate(
+    ({ taskTitle, exp }) => {
+      type StoreLike = {
+        subscribe: (next: (s: unknown) => void) => { unsubscribe: () => void };
+      };
+      type TaskLike = {
+        title: string;
+        dueDay?: string | null;
+        dueWithTime?: number | null;
+        remindAt?: number | null;
+        repeatCfgId?: string | null;
+      };
+      type CfgLike = Record<string, unknown> & {
+        repeatCycle: string;
+        repeatEvery: number;
+        startTime?: string | null;
+      };
+      const store = (window as unknown as { __e2eTestHelpers?: { store?: StoreLike } })
+        .__e2eTestHelpers?.store;
+      if (!store) throw new Error('__e2eTestHelpers.store missing');
+      let state:
+        | {
+            tasks: { entities: Record<string, TaskLike | undefined> };
+            taskRepeatCfg: { entities: Record<string, CfgLike | undefined> };
+          }
+        | undefined;
+      store.subscribe((s) => (state = s as typeof state)).unsubscribe();
+      const task = Object.values(state?.tasks.entities ?? {}).find(
+        (t) => t?.title === taskTitle,
+      );
+      if (!task) return null;
+      const cfg = task.repeatCfgId
+        ? state?.taskRepeatCfg.entities[task.repeatCfgId]
+        : undefined;
+      const days = [
+        'monday',
+        'tuesday',
+        'wednesday',
+        'thursday',
+        'friday',
+        'saturday',
+        'sunday',
+      ];
+      let expectedDueWithTime: number | null = null;
+      if (exp) {
+        const [y, m, d] = exp.day.split('-').map(Number);
+        const [hh, mm] = exp.time.split(':').map(Number);
+        expectedDueWithTime = new Date(y, m - 1, d, hh, mm).getTime();
+      }
+      return {
+        dueDay: task.dueDay ?? null,
+        dueWithTime: task.dueWithTime ?? null,
+        expectedDueWithTime,
+        hasRemindAt: typeof task.remindAt === 'number',
+        repeat: cfg
+          ? {
+              repeatCycle: cfg.repeatCycle,
+              repeatEvery: cfg.repeatEvery,
+              startTime: cfg.startTime ?? null,
+              weekdays: days.filter((day) => cfg[day] === true),
+            }
+          : null,
+      };
+    },
+    { taskTitle: title, exp: expected },
+  );
 
 const pendingCount = async (user: TestUser): Promise<number> => {
   const response = await postJson('/api/capture/grants', user.token, undefined, 'GET');
@@ -199,6 +306,48 @@ const joinClient = async (
   return client;
 };
 
+type ClaimResponseBody =
+  | { status: 'ok'; items: Array<{ itemId: string }> }
+  | { status: 'no_key' | 'key_mismatch' };
+
+/**
+ * Like joinClient, but also resolves with the body of the joining device's
+ * first capture claim. Counting tasks right after the join proves nothing on
+ * its own: B's import may not have run yet, and a later run could still add a
+ * duplicate. Waiting for that claim shows what B's import was given.
+ */
+const joinClientRecordingFirstClaim = async (
+  browser: Browser,
+  baseURL: string,
+  testRunId: string,
+  user: TestUser,
+): Promise<{ client: SimulatedE2EClient; firstClaim: Promise<ClaimResponseBody> }> => {
+  const client = await createSimulatedClient(browser, baseURL, 'B', testRunId);
+  const firstClaim = client.page
+    .waitForResponse(
+      (response) =>
+        response.request().method() === 'POST' &&
+        new URL(response.url()).pathname.endsWith('/api/capture/claim'),
+      { timeout: IMPORT_TIMEOUT },
+    )
+    .then(async (response) => {
+      expect(response.status()).toBe(200);
+      return (await response.json()) as ClaimResponseBody;
+    });
+  // Awaited by the caller; never left as an unhandled rejection.
+  firstClaim.catch(() => undefined);
+  await client.sync.setupSuperSync(getSuperSyncConfig(user));
+  await client.sync.syncAndWait();
+  return { client, firstClaim };
+};
+
+/** B's first claim ran with the key and was given nothing to import. */
+const expectEmptyClaim = async (
+  firstClaim: Promise<ClaimResponseBody>,
+): Promise<void> => {
+  expect(await firstClaim).toEqual({ status: 'ok', items: [] });
+};
+
 test.describe('@supersync Agent task capture', () => {
   let clientA: SimulatedE2EClient | null = null;
   let clientB: SimulatedE2EClient | null = null;
@@ -295,7 +444,15 @@ test.describe('@supersync Agent task capture', () => {
     await a.sync.startSync();
     await expectInboxTasks(a, title, 1);
     await a.sync.syncAndWait();
-    clientB = await joinClient(browser, baseURL!, testRunId, user);
+    const joined = await joinClientRecordingFirstClaim(
+      browser,
+      baseURL!,
+      testRunId,
+      user,
+    );
+    clientB = joined.client;
+    // A acked the item, so B's import must get nothing to create again.
+    await expectEmptyClaim(joined.firstClaim);
     await expectInboxTasks(clientB, title, 1);
     await clientB.sync.syncAndWait();
     await expectInboxTasks(clientB, title, 1);
@@ -316,10 +473,82 @@ test.describe('@supersync Agent task capture', () => {
     await expectInboxTasks(a, title, 1);
     await a.sync.syncAndWait();
 
-    clientB = await joinClient(browser, baseURL!, testRunId, user);
+    const joined = await joinClientRecordingFirstClaim(
+      browser,
+      baseURL!,
+      testRunId,
+      user,
+    );
+    clientB = joined.client;
     // B imports too (the key arrived by sync): the acked item must not return.
+    await expectEmptyClaim(joined.firstClaim);
     await clientB.sync.syncAndWait();
     await expectInboxTasks(clientB, title, 1);
+  });
+
+  test('scheduled and recurring tasks keep their day, time and repeat on every device', async ({
+    browser,
+    baseURL,
+    testRunId,
+  }) => {
+    const { user, client: a, token } = await setUpCapture(browser, baseURL!, testRunId);
+    clientA = a;
+    const dayTitle = `Day-${testRunId}`;
+    const timedTitle = `Timed-${testRunId}`;
+    const weeklyTitle = `Weekly-${testRunId}`;
+    const thursday = nextWeekday(4);
+    const monday = nextWeekday(1);
+    await captureTask(token, dayTitle, { dueDate: thursday });
+    await captureTask(token, timedTitle, { dueDate: thursday, dueTime: '14:30' });
+    await captureTask(token, weeklyTitle, {
+      dueDate: monday,
+      dueTime: '09:15',
+      repeat: { cycle: 'weekly', weekdays: ['wed', 'mon'] },
+    });
+
+    await a.sync.startSync();
+    await expectInboxTasks(a, weeklyTitle, 1);
+    await waitForNoPending(user);
+
+    const expectSchedules = async (client: SimulatedE2EClient): Promise<void> => {
+      // Polled: the repeat config's effects settle the task after the add.
+      await expect
+        .poll(() => getCapturedSchedule(client.page, dayTitle, null))
+        .toEqual(
+          expect.objectContaining({ dueDay: thursday, dueWithTime: null, repeat: null }),
+        );
+      const timed = await getCapturedSchedule(client.page, timedTitle, {
+        day: thursday,
+        time: '14:30',
+      });
+      expect(timed?.dueDay).toBeNull();
+      expect(timed?.dueWithTime).toBe(timed?.expectedDueWithTime);
+      expect(timed?.repeat).toBeNull();
+      // The default reminder option (AtStart) applies to a timed capture.
+      expect(timed?.hasRemindAt).toBe(true);
+      await expect
+        .poll(async () => {
+          const weekly = await getCapturedSchedule(client.page, weeklyTitle, {
+            day: monday,
+            time: '09:15',
+          });
+          return weekly && weekly.dueWithTime === weekly.expectedDueWithTime
+            ? weekly.repeat
+            : null;
+        })
+        .toEqual({
+          repeatCycle: 'WEEKLY',
+          repeatEvery: 1,
+          startTime: '09:15',
+          weekdays: ['monday', 'wednesday'],
+        });
+    };
+
+    await expectSchedules(a);
+    await a.sync.syncAndWait();
+    clientB = await joinClient(browser, baseURL!, testRunId, user);
+    await expectInboxTasks(clientB, weeklyTitle, 1);
+    await expectSchedules(clientB);
   });
 
   test('a restart between creating the task and its ack leaves one task', async ({
@@ -390,7 +619,16 @@ test.describe('@supersync Agent task capture', () => {
 
     // A goes away still holding the lease; B finds nothing it may claim.
     await a.context.setOffline(true);
-    clientB = await joinClient(browser, baseURL!, testRunId, user);
+    const joined = await joinClientRecordingFirstClaim(
+      browser,
+      baseURL!,
+      testRunId,
+      user,
+    );
+    clientB = joined.client;
+    // B's claim must actually have run (and found the lease held) before the
+    // pending count says anything.
+    await expectEmptyClaim(joined.firstClaim);
     expect(await pendingCount(user)).toBe(1);
     // Once the lease expires, B takes the item over.
     await expireCaptureLeases(user);
